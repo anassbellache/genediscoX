@@ -1,0 +1,209 @@
+Detailed Report on Implementing Level‑Set DiscoBAX in GeneDisco 
+
+1. High-Level Overview 
+
+Goal: We want to adapt DiscoBAX—the Bayesian-Algorithm-Execution technique—for level-set discovery rather than top-kk subset selection. Specifically, we want to identify all inputs xx such that f(x)≥cf(x) \ge c, where ff is an unknown function modeled by a GP. In other words, we want to recover the entire super-level set: 
+
+Xc={x∈X:f(x)≥c}.X_c = \{ x \in X : f(x) \ge c \}.  
+
+We retain DiscoBAX’s overarching “information-gain” logic (InfoBAX) but replace the “select top-kk” subroutine with a “take all xx with f(x)≥cf(x) \ge c” step. 
+
+GeneDisco Integration 
+
+GeneDisco uses Slingpy for its pipeline. We typically create: 
+
+    A model class (subclass of AbstractBaseModel) with train_model, predict, posterior methods, etc. 
+
+    A batch acquisition function (subclass of BaseBatchAcquisitionFunction) that nominates the next batch of experiments. 
+
+In our case: 
+
+    The model can be a GPU-accelerated GPyTorch/BoTorch SingleTaskVariationalGP (or exact GP) as we have previously demonstrated in “GeneDiscoSTVGPModel.” 
+
+    The acquisition function will be a “LevelSetBAX” class. It will compute the Expected Information Gain (EIG) between a candidate observation YxY_x and the level-set membership for the entire set. 
+
+ 
+
+2. The Key Components of Level‑Set DiscoBAX 
+
+2.1 Surrogate Model 
+
+A typical choice is GPyTorch + BoTorch with: 
+
+    Exact GP (SingleTaskGP) or a Sparse GP if the dataset is large. 
+
+    A standard Gaussian likelihood to handle additive noise. 
+
+    GPU acceleration turned on for speed. 
+
+Integration: 
+
+    In GeneDisco, you usually have a class (e.g. GeneDiscoSTVGPModel) that wraps the BoTorch/GPyTorch model. 
+
+    The model’s device is decided in __init__ (e.g. 'cuda' if torch.cuda.is_available() else 'cpu'). 
+
+    Training is done in train_model(X_train, Y_train), inference in predict(X_test) or posterior(X_test). 
+
+2.2 Level-Set Algorithm 
+
+“LevelSet(c)” is straightforward: 
+
+LevelSet(c,f)={x∈X:f(x)≥c}.\text{LevelSet}(c, f) = \{ x \in X : f(x) \ge c \}.  
+
+Given a function sample f(⋅)f(\cdot), you threshold it. In code: 
+
+mask = (f_values >= c)  # boolean 
+subset_idx = torch.where(mask)[0] 
+  
+
+No submodular selection loop is needed (unlike top-kk disco). 
+
+2.3 The InfoBAX EIG Computation 
+
+DiscoBAX picks the next experiment x\*x^\* that maximizes: 
+
+I(Yx;S)=H(S)−EYx[H(S∣Yx)].I(Y_x; S) = H(S) - \mathbb{E}_{Y_x}[H(S \mid Y_x)].  
+
+    SS is the random set {x:f(x)≥c}\{x: f(x) \ge c\}. 
+
+    EYx\mathbb{E}_{Y_x} is the expectation over the unknown observation Yx=f(x)Y_x=f(x). 
+
+    The distribution is given by the GP posterior. 
+
+In practice, you can compute or approximate I(Yx;S)I(Y_x; S) via: 
+
+    Monte Carlo approach: Sample many posterior functions, form the sets SjS_j, measure how knowledge of YxY_x would reduce set uncertainty. 
+
+    Analytical approach: If using a Gaussian process, you can do a Bernoulli-entropy formula with 1D quadrature or a small numerical integration. This avoids big MC loops for each candidate. 
+
+GeneDisco pipeline typically expects a function: 
+
+def __call__( 
+    self,  
+    dataset_x,  
+    batch_size: int,  
+    available_indices: List[str],  
+    last_selected_indices: List[str],  
+    last_model: AbstractBaseModel 
+) -> List[str]: 
+    ... 
+  
+
+It returns the top batch_size points by EIG. 
+
+ 
+
+3. Concrete Implementation Steps 
+
+Below is the recommended path: 
+
+    Model Setup: 
+
+    Use a GPU-accelerated GP class (GeneDiscoSTVGPModel or an ExactGP wrapper). 
+
+    Ensure it has model.posterior(X) returning a BoTorch Posterior. 
+
+    LevelSetBAXAcquisition Class: 
+
+    Subclass BaseBatchAcquisitionFunction. 
+
+    In __call__, gather the candidate features for available_indices from dataset_x. 
+
+    Compute the GP posterior over all candidates once (for speed). 
+
+    For each candidate xx, compute EIG(x)(x) by either: 
+
+    Monte Carlo: (a) draw multiple function samples from the GP; (b) for each sample, see how the set changes if f(x)f(x) is known; average. 
+
+    Quadrature: use Bernoulli-entropy formulas + Gauss-Hermite integration, to do a 1D integral over possible YxY_x values. This is more direct but requires a bit more math. 
+
+    Selecting a Batch: 
+
+    Once you have EIG for every candidate, pick the top batch_size indices. 
+
+    Return them as a list of strings (the IDs in available_indices). 
+
+    Repeat: 
+
+    GeneDisco will query those points in the real system, get new data, and retrain the model. The level-set search continues until your budget is exhausted. 
+
+ 
+
+4. Example Outline of LevelSetBAXAcquisition 
+
+from genedisco.active_learning_methods.acquisition_functions.base_acquisition_function import BaseBatchAcquisitionFunction 
+ 
+class LevelSetBAXAcquisition(BaseBatchAcquisitionFunction): 
+    def __init__( 
+        self, 
+        threshold_value: float, 
+        num_posterior_samples: int = 50, 
+        # ... other config like noise_type, device, etc. ... 
+    ): 
+        super().__init__() 
+        self.c = threshold_value 
+        self.M = num_posterior_samples 
+        # possibly store a device or other config 
+ 
+    def __call__( 
+        self,  
+        dataset_x,  
+        batch_size: int,  
+        available_indices: List[str],  
+        last_selected_indices: List[str],  
+        last_model 
+    ) -> List[str]: 
+        # 1) Get features for the available indices (as NumPy or torch). 
+        #    Suppose dataset_x.get_features(...) or dataset_x.subset(...). 
+        #    Convert to torch tensor on model.device if needed. 
+         
+        # 2) Evaluate GP posterior at all these candidates 
+        #    posterior = last_model.posterior(X_candidates) 
+         
+        # 3) For each candidate x_i, compute EIG(x_i). 
+        #    Example (Monte Carlo): 
+        #       EIG(x_i) = H(S) - E_{f(x_i)}[H(S|f(x_i))] 
+        #    We'll do: 
+        #       (a) sample M function draws: f^(m) 
+        #       (b) let S^(m) = { j : f^(m)(x_j) >= c } 
+        #       (c) for each draw, see how knowledge of x_i changes S^(m) 
+        #    Or do the quadrature approach with Bernoulli entropies. 
+         
+        # 4) Identify top `batch_size` by EIG 
+        #    chosen_indices = ... 
+         
+        # 5) Return chosen indices as a list of str 
+        return chosen_indices 
+  
+
+Performance: 
+
+    If X_candidates is thousands of points, consider GPyTorch’s fast_pred_var or fast_pred_samples for speed. 
+
+    For high dimension, consider a sparse GP or a deep kernel GP. 
+
+ 
+
+5. Debugging & Validation 
+
+    Test on synthetic 1D or 2D with a known threshold to confirm the EIG logic is correct. 
+
+    Check memory usage on GPU for large candidate sets. Possibly do iterative subsets of candidates if needed. 
+
+    Check final “recovered set” for correctness: after T rounds, compare the posterior-based level-set X^c\hat{X}_c to the ground truth if known. 
+
+ 
+
+6. Summary 
+
+    Level-Set DiscoBAX is simple to incorporate: 
+
+    Replace the top-kk subroutine in DiscoBAX with a threshold-based set. 
+
+    Let the acquisition function compute EIG about that set. 
+
+    Return the best points for measuring. 
+
+    GeneDisco sees no difference from the outside: it calls your new LevelSetBAXAcquisition just like any other batch function, but behind the scenes we’re performing level-set Bayesian Algorithm Execution. 
+
+ 
